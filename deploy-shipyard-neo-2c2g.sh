@@ -184,6 +184,22 @@ bay_healthy_http() {
   curl -fsS --connect-timeout 2 --max-time 3 "http://127.0.0.1:${BAY_PORT}/health" >/dev/null 2>&1
 }
 
+# 检查宿主机端口是否对非本机可达（避免旧版只绑 127.0.0.1）
+bay_publishes_remotely() {
+  local line
+  line=$(docker port bay 8114 2>/dev/null || true)
+  [[ -z "$line" ]] && return 1
+  # 期望类似 0.0.0.0:8114 或 [::]:8114；若只有 127.0.0.1:8114 则跨机不可达
+  if echo "$line" | grep -Eq '0\.0\.0\.0:|\[::\]:'; then
+    return 0
+  fi
+  if echo "$line" | grep -Eq '127\.0\.0\.1:|\[::1\]:'; then
+    return 1
+  fi
+  # 绑到具体公网 IP 也算可远程
+  return 0
+}
+
 detect_bitwarden() {
   # 匹配常见自建：vaultwarden / bitwarden / bwdata 相关容器
   docker ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
@@ -503,12 +519,24 @@ printf '%s\n' "$FILL_HOST" > "$DEPLOY_DIR/.public_host"
 ENDPOINT="http://${FILL_HOST}:${BAY_PORT}"
 info "AstrBot Endpoint 将使用: ${ENDPOINT}"
 
-# ── 已健康：默认只打印配置并退出 ──
+# ── 已健康：还要确认端口是否对跨机开放 ──
 if [[ "$HEALTHY" == "1" && "$FORCE" != "1" ]]; then
-  info "Bay 已在健康运行。跳过拉取/重启（需要重建请加 FORCE=1）。"
-  write_fill_file "$ENDPOINT" "$API_KEY"
-  print_astrbot_fill "$ENDPOINT" "$API_KEY"
-  exit 0
+  PORTMAP=$(docker port bay 8114 2>/dev/null || echo "")
+  info "当前端口映射: ${PORTMAP:-未知}"
+  if ! bay_publishes_remotely; then
+    warn "本机 health 通，但 8114 只绑在 127.0.0.1（或未正确发布）。"
+    warn "AstrBot 在另一台机器上会「无法连接」。将自动按跨机方式重建监听。"
+    FORCE=1
+  else
+    info "Bay 已在健康运行，且端口可被远程访问。跳过拉取/重启（需要重建请加 FORCE=1）。"
+    write_fill_file "$ENDPOINT" "$API_KEY"
+    print_astrbot_fill "$ENDPOINT" "$API_KEY"
+    echo
+    warn "若 AstrBot 仍提示无法连接：请在「机器人那台机器」执行:"
+    echo "  curl -v --connect-timeout 5 ${ENDPOINT}/health"
+    echo "若这里都超时，是云安全组/防火墙没放行 ${BAY_PORT}，不是 AstrBot 配置问题。"
+    exit 0
+  fi
 fi
 
 # ── 容器存在但未健康：尝试拉起 ──
@@ -566,4 +594,14 @@ if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null |
   warn "检测到 firewalld：请放行 ${BAY_PORT}/tcp"
 fi
 
+PORTMAP=$(docker port bay 8114 2>/dev/null || echo "")
+info "当前端口映射: ${PORTMAP:-未知}"
+if ! bay_publishes_remotely; then
+  warn "警告: 端口似乎仍未对 0.0.0.0 发布，跨机不可达。"
+fi
+
 print_astrbot_fill "$ENDPOINT" "$API_KEY"
+echo
+warn "请立刻在「AstrBot 所在机器」验证（不要在沙盒机上测）:"
+echo "  curl -v --connect-timeout 5 ${ENDPOINT}/health"
+echo "这里超时 = 云安全组/防火墙未放行 ${BAY_PORT}；返回 JSON/ok = 网络已通，再查 Token。"

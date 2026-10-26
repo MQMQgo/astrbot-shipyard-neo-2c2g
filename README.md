@@ -58,6 +58,23 @@ curl -fsSL https://raw.githubusercontent.com/MQMQgo/astrbot-shipyard-neo-2c2g/ma
 
 脚本结束时会逐项打印，并写入 `~/astrbot-shipyard-neo/astrbot-fill.txt`。
 
+
+## AstrBot 提示「无法连接」时
+
+脚本本机 `/health` 通过 **不等于** 跨机可达。常见原因：
+
+1. **旧部署只监听了 `127.0.0.1`**（早期脚本默认）。解决：
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/MQMQgo/astrbot-shipyard-neo-2c2g/main/install.sh | FORCE=1 PUBLIC_HOST=你的正确公网IP bash
+   ```
+   然后看输出里的端口映射应类似 `0.0.0.0:8114`。
+2. **云安全组 / 防火墙没放行 8114**。在 **AstrBot 那台机器**执行：
+   ```bash
+   curl -v --connect-timeout 5 http://你的正确公网IP:8114/health
+   ```
+   超时就是网络问题，不是 Token 问题。
+3. Token 填错：网络通但仍鉴权失败时再核对 `.api_key`。
+
 ## 防火墙
 
 沙盒机放行 `8114/tcp`，云安全组建议 **只允许 AstrBot 所在机器 IP**。
