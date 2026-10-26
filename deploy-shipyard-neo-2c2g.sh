@@ -43,20 +43,32 @@ confirm_or_auto() {
   fi
 }
 
-detect_public_host() {
-  local h=""
-  if [[ -n "$PUBLIC_HOST" ]]; then
-    echo "$PUBLIC_HOST"
-    return
-  fi
-  # 上次探测结果缓存，避免断线后反复打外网
-  if [[ -f "$DEPLOY_DIR/.public_host" ]]; then
-    h=$(tr -d '\n\r ' < "$DEPLOY_DIR/.public_host")
-    if [[ -n "$h" ]]; then
-      echo "$h"
-      return
-    fi
-  fi
+is_private_ip() {
+  # 10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, 100.64/10(CGNAT)
+  local ip="$1" a b
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+  a=${ip%%.*}; b=${ip#*.}; b=${b%%.*}
+  (( a == 10 )) && return 0
+  (( a == 127 )) && return 0
+  (( a == 192 && b == 168 )) && return 0
+  (( a == 169 && b == 254 )) && return 0
+  (( a == 172 && b >= 16 && b <= 31 )) && return 0
+  (( a == 100 && b >= 64 && b <= 127 )) && return 0
+  return 1
+}
+
+list_local_ipv4() {
+  # 本机网卡 IPv4，排除 lo / docker / br- / veth
+  ip -4 -o addr show scope global 2>/dev/null \
+    | awk '{
+        iface=$2; gsub(/\/.*$/,"",$4); ip=$4;
+        if (iface ~ /^(lo|docker|br-|veth|virbr|cni|flannel)/) next;
+        print ip;
+      }' || true
+}
+
+detect_egress_ip() {
+  local h="" url
   for url in \
     "https://api.ipify.org" \
     "https://ifconfig.me/ip" \
@@ -68,12 +80,95 @@ detect_public_host() {
       return
     fi
   done
-  h=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
-  if [[ -n "$h" ]]; then
-    echo "$h"
+}
+
+detect_public_host() {
+  local h="" cand="" picked="" egress=""
+  local -a locals=() publics=()
+
+  # 1) 用户显式指定：最高优先，绝不覆盖
+  if [[ -n "$PUBLIC_HOST" ]]; then
+    echo "$PUBLIC_HOST"
     return
   fi
-  hostname -I 2>/dev/null | awk '{print $1}'
+
+  mapfile -t locals < <(list_local_ipv4 | awk 'NF' | awk '!seen[$0]++')
+  for cand in "${locals[@]}"; do
+    if ! is_private_ip "$cand"; then
+      publics+=("$cand")
+    fi
+  done
+
+  egress=$(detect_egress_ip || true)
+
+  echo -e "${CYN}---- IP 候选 ----${NC}" >&2
+  if ((${#locals[@]})); then
+    echo -e "  本机网卡: ${locals[*]}" >&2
+  else
+    echo -e "  本机网卡: (无)" >&2
+  fi
+  echo -e "  出口探测: ${egress:-失败}" >&2
+  if [[ -f "$DEPLOY_DIR/.public_host" ]]; then
+    echo -e "  上次缓存: $(tr -d '\n\r ' < "$DEPLOY_DIR/.public_host")" >&2
+  fi
+
+  # 2) 本机网卡上的公网 IP（VPS 主 IP 通常在这里，比出口探测更可信）
+  if ((${#publics[@]} == 1)); then
+    picked="${publics[0]}"
+    echo -e "  选用: ${picked}（本机公网网卡）" >&2
+  elif ((${#publics[@]} > 1)); then
+    # 若出口 IP 正好落在候选里，用它；否则用第一个并警告
+    picked="${publics[0]}"
+    for cand in "${publics[@]}"; do
+      if [[ -n "$egress" && "$cand" == "$egress" ]]; then
+        picked="$cand"
+        break
+      fi
+    done
+    echo -e "  选用: ${picked}（多块公网网卡，可用 PUBLIC_HOST= 指定）" >&2
+    echo -e "  全部公网候选: ${publics[*]}" >&2
+  fi
+
+  # 3) 出口探测：仅当与本机公网一致，或本机没有公网网卡时才用
+  if [[ -z "$picked" && -n "$egress" ]]; then
+    if ! is_private_ip "$egress"; then
+      # 出口 IP 不在本机网卡上时，多半是 NAT/CDN，跨机回连会错
+      local on_nic=0
+      for cand in "${locals[@]}"; do
+        [[ "$cand" == "$egress" ]] && on_nic=1 && break
+      done
+      if (( on_nic == 1 )); then
+        picked="$egress"
+        echo -e "  选用: ${picked}（出口探测且在本机网卡上）" >&2
+      else
+        echo -e "  ${YLW}[!]${NC} 出口 IP ${egress} 不在本机网卡上（可能是 NAT），不采用。" >&2
+      fi
+    fi
+  fi
+
+  # 4) 上次缓存（必须是公网且仍挂在本机网卡上）
+  if [[ -z "$picked" && -f "$DEPLOY_DIR/.public_host" ]]; then
+    h=$(tr -d '\n\r ' < "$DEPLOY_DIR/.public_host")
+    if [[ -n "$h" ]] && ! is_private_ip "$h"; then
+      for cand in "${locals[@]}"; do
+        if [[ "$cand" == "$h" ]]; then
+          picked="$h"
+          echo -e "  选用: ${picked}（缓存且仍在本机网卡）" >&2
+          break
+        fi
+      done
+    fi
+  fi
+
+  # 5) 实在没有：给出明确错误，要求 PUBLIC_HOST
+  if [[ -z "$picked" ]]; then
+    echo -e "  ${RED}[x]${NC} 未能可靠确定 VPS 公网 IP。" >&2
+    echo -e "  请用: PUBLIC_HOST=你的VPS公网IP bash ..." >&2
+    return 1
+  fi
+
+  echo -e "${CYN}----------------${NC}" >&2
+  echo "$picked"
 }
 
 image_present() {
@@ -396,10 +491,17 @@ if [[ -z "${API_KEY:-}" ]]; then
   info "已生成新 API Key → $DEPLOY_DIR/.api_key"
 fi
 
-FILL_HOST=$(detect_public_host)
-[[ -n "$FILL_HOST" ]] || err "无法探测沙盒机 IP，请用 PUBLIC_HOST=你的公网IP 再运行"
+if ! FILL_HOST=$(detect_public_host); then
+  err "无法可靠确定 VPS 公网 IP。请显式指定：PUBLIC_HOST=你的VPS公网IP"
+fi
+[[ -n "$FILL_HOST" ]] || err "无法可靠确定 VPS 公网 IP。请显式指定：PUBLIC_HOST=你的VPS公网IP"
+if is_private_ip "$FILL_HOST"; then
+  err "当前选中的是内网地址 ${FILL_HOST}，跨机 AstrBot 无法访问。请用 PUBLIC_HOST=VPS公网IP 重跑。"
+fi
+# 仅在用户指定或探测成功后写入缓存
 printf '%s\n' "$FILL_HOST" > "$DEPLOY_DIR/.public_host"
 ENDPOINT="http://${FILL_HOST}:${BAY_PORT}"
+info "AstrBot Endpoint 将使用: ${ENDPOINT}"
 
 # ── 已健康：默认只打印配置并退出 ──
 if [[ "$HEALTHY" == "1" && "$FORCE" != "1" ]]; then
