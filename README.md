@@ -69,6 +69,18 @@ curl -fsSL https://raw.githubusercontent.com/MQMQgo/astrbot-shipyard-neo-2c2g/ma
    超时就是网络问题，不是 Token 问题。
 3. Token 填错：网络通但仍鉴权失败时再核对 `.api_key`。
 
-## 防火墙
+## 防火墙（一键放行 8114）
 
-沙盒机放行 `8114/tcp`，云安全组建议 **只允许 AstrBot 所在机器 IP**。
+在**沙盒机**执行（自动识别 ufw / firewalld / iptables / nftables）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MQMQgo/astrbot-shipyard-neo-2c2g/main/open-8114.sh | sudo bash
+```
+
+只允许 AstrBot 机器访问（推荐）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MQMQgo/astrbot-shipyard-neo-2c2g/main/open-8114.sh | sudo SOURCE=AstrBot公网IP bash
+```
+
+主机防火墙放行后，若 AstrBot 侧仍超时，再到**云安全组**放行 TCP `8114`（来源建议仅 AstrBot IP）。
