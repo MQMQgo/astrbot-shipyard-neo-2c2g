@@ -9,16 +9,10 @@
 
 ## 一键部署（在沙盒机执行）
 
-> **务必带上 `PUBLIC_HOST=VPS公网IP`**。自动探测可能拿到 NAT 出口地址，不是你要给 AstrBot 填的回连 IP。
+> 脚本会自动获取公网 IP（本机网卡 → 云 metadata → 出口探测）。一般直接跑下面命令即可；只有自动结果不对时才需要 `PUBLIC_HOST=`。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MQMQgo/astrbot-shipyard-neo-2c2g/main/install.sh | PUBLIC_HOST=你的公网IP bash
-```
-
-示例：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MQMQgo/astrbot-shipyard-neo-2c2g/main/install.sh | PUBLIC_HOST=107.174.175.25 bash
 ```
 
 Bitwarden 更吃内存时：

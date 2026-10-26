@@ -58,11 +58,11 @@ is_private_ip() {
 }
 
 list_local_ipv4() {
-  # 本机网卡 IPv4，排除 lo / docker / br- / veth
+  # 本机网卡 IPv4，排除 lo / docker / br- / veth 等
   ip -4 -o addr show scope global 2>/dev/null \
     | awk '{
         iface=$2; gsub(/\/.*$/,"",$4); ip=$4;
-        if (iface ~ /^(lo|docker|br-|veth|virbr|cni|flannel)/) next;
+        if (iface ~ /^(lo|docker|br-|veth|virbr|cni|flannel|nerdctl)/) next;
         print ip;
       }' || true
 }
@@ -72,24 +72,62 @@ detect_egress_ip() {
   for url in \
     "https://api.ipify.org" \
     "https://ifconfig.me/ip" \
-    "https://icanhazip.com"
+    "https://icanhazip.com" \
+    "https://ipv4.icanhazip.com"
   do
     h=$(curl -4 -fsS --connect-timeout 3 --max-time 5 "$url" 2>/dev/null | tr -d '\n\r ' || true)
     if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       echo "$h"
-      return
+      return 0
     fi
   done
+  return 1
+}
+
+# 常见云厂商 metadata（仅在能通链路本地 169.254.169.254 时）
+detect_cloud_metadata_ip() {
+  local h=""
+  # AWS / 部分兼容
+  h=$(curl -4 -fsS --connect-timeout 1 --max-time 2 \
+    http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null | tr -d '\n\r ' || true)
+  if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$h"; return 0; fi
+
+  # DigitalOcean
+  h=$(curl -4 -fsS --connect-timeout 1 --max-time 2 \
+    http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address 2>/dev/null | tr -d '\n\r ' || true)
+  if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$h"; return 0; fi
+
+  # OpenStack
+  h=$(curl -4 -fsS --connect-timeout 1 --max-time 2 \
+    http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null | tr -d '\n\r ' || true)
+  if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$h"; return 0; fi
+
+  # GCP
+  h=$(curl -4 -fsS --connect-timeout 1 --max-time 2 \
+    -H "Metadata-Flavor: Google" \
+    http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip \
+    2>/dev/null | tr -d '\n\r ' || true)
+  if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$h"; return 0; fi
+
+  # Azure
+  h=$(curl -4 -fsS --connect-timeout 1 --max-time 2 \
+    -H "Metadata: true" \
+    "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text" \
+    2>/dev/null | tr -d '\n\r ' || true)
+  if [[ "$h" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$h"; return 0; fi
+
+  return 1
 }
 
 detect_public_host() {
-  local h="" cand="" picked="" egress=""
+  local h="" cand="" picked="" egress="" meta=""
   local -a locals=() publics=()
 
-  # 1) 用户显式指定：最高优先，绝不覆盖
+  # 1) 用户显式指定
   if [[ -n "$PUBLIC_HOST" ]]; then
+    info "使用你指定的 PUBLIC_HOST=${PUBLIC_HOST}" >&2
     echo "$PUBLIC_HOST"
-    return
+    return 0
   fi
 
   mapfile -t locals < <(list_local_ipv4 | awk 'NF' | awk '!seen[$0]++')
@@ -99,77 +137,81 @@ detect_public_host() {
     fi
   done
 
+  meta=$(detect_cloud_metadata_ip || true)
   egress=$(detect_egress_ip || true)
 
-  echo -e "${CYN}---- IP 候选 ----${NC}" >&2
+  echo -e "${CYN}---- 自动获取公网 IP ----${NC}" >&2
   if ((${#locals[@]})); then
     echo -e "  本机网卡: ${locals[*]}" >&2
   else
     echo -e "  本机网卡: (无)" >&2
   fi
+  echo -e "  云 metadata: ${meta:-无}" >&2
   echo -e "  出口探测: ${egress:-失败}" >&2
-  if [[ -f "$DEPLOY_DIR/.public_host" ]]; then
-    echo -e "  上次缓存: $(tr -d '\n\r ' < "$DEPLOY_DIR/.public_host")" >&2
-  fi
 
-  # 2) 本机网卡上的公网 IP（VPS 主 IP 通常在这里，比出口探测更可信）
+  # 2) 本机恰好一块公网网卡 —— 最常见的 VPS 情况，直接用
   if ((${#publics[@]} == 1)); then
     picked="${publics[0]}"
-    echo -e "  选用: ${picked}（本机公网网卡）" >&2
+    echo -e "  ${GRN}选用: ${picked}（本机唯一公网网卡）${NC}" >&2
   elif ((${#publics[@]} > 1)); then
-    # 若出口 IP 正好落在候选里，用它；否则用第一个并警告
     picked="${publics[0]}"
     for cand in "${publics[@]}"; do
-      if [[ -n "$egress" && "$cand" == "$egress" ]]; then
-        picked="$cand"
-        break
-      fi
+      if [[ -n "$meta" && "$cand" == "$meta" ]]; then picked="$cand"; break; fi
+      if [[ -n "$egress" && "$cand" == "$egress" ]]; then picked="$cand"; break; fi
     done
-    echo -e "  选用: ${picked}（多块公网网卡，可用 PUBLIC_HOST= 指定）" >&2
-    echo -e "  全部公网候选: ${publics[*]}" >&2
+    echo -e "  ${GRN}选用: ${picked}（多块公网网卡中匹配 metadata/出口）${NC}" >&2
+    echo -e "  其余候选: ${publics[*]}" >&2
   fi
 
-  # 3) 出口探测：仅当与本机公网一致，或本机没有公网网卡时才用
-  if [[ -z "$picked" && -n "$egress" ]]; then
-    if ! is_private_ip "$egress"; then
-      # 出口 IP 不在本机网卡上时，多半是 NAT/CDN，跨机回连会错
-      local on_nic=0
-      for cand in "${locals[@]}"; do
-        [[ "$cand" == "$egress" ]] && on_nic=1 && break
-      done
-      if (( on_nic == 1 )); then
+  # 3) 云 metadata（且为公网地址）
+  if [[ -z "$picked" && -n "$meta" ]] && ! is_private_ip "$meta"; then
+    picked="$meta"
+    echo -e "  ${GRN}选用: ${picked}（云厂商 metadata）${NC}" >&2
+  fi
+
+  # 4) 出口探测：只有落在本机网卡上才采用，避免 NAT 假地址
+  if [[ -z "$picked" && -n "$egress" ]] && ! is_private_ip "$egress"; then
+    local on_nic=0
+    for cand in "${locals[@]}"; do
+      [[ "$cand" == "$egress" ]] && on_nic=1 && break
+    done
+    if (( on_nic == 1 )); then
+      picked="$egress"
+      echo -e "  ${GRN}选用: ${picked}（出口探测且在本机网卡）${NC}" >&2
+    else
+      # 很多小鸡：公网 IP 只做 DNAT，网卡上只有内网 IP，出口探测才是对外 IP
+      # 这种情况下 AstrBot 跨机必须用出口公网 IP
+      if ((${#publics[@]} == 0)) && ((${#locals[@]} > 0)); then
         picked="$egress"
-        echo -e "  选用: ${picked}（出口探测且在本机网卡上）" >&2
+        echo -e "  ${YLW}选用: ${picked}（网卡均为内网，采用出口公网 IP；若不对请设 PUBLIC_HOST）${NC}" >&2
       else
-        echo -e "  ${YLW}[!]${NC} 出口 IP ${egress} 不在本机网卡上（可能是 NAT），不采用。" >&2
+        echo -e "  ${YLW}[!] 出口 IP ${egress} 不在本机网卡，暂不采用${NC}" >&2
       fi
     fi
   fi
 
-  # 4) 上次缓存（必须是公网且仍挂在本机网卡上）
+  # 5) 有效缓存
   if [[ -z "$picked" && -f "$DEPLOY_DIR/.public_host" ]]; then
     h=$(tr -d '\n\r ' < "$DEPLOY_DIR/.public_host")
     if [[ -n "$h" ]] && ! is_private_ip "$h"; then
-      for cand in "${locals[@]}"; do
-        if [[ "$cand" == "$h" ]]; then
-          picked="$h"
-          echo -e "  选用: ${picked}（缓存且仍在本机网卡）" >&2
-          break
-        fi
-      done
+      picked="$h"
+      echo -e "  ${GRN}选用: ${picked}（上次成功缓存）${NC}" >&2
     fi
   fi
 
-  # 5) 实在没有：给出明确错误，要求 PUBLIC_HOST
+  echo -e "${CYN}------------------------${NC}" >&2
+
   if [[ -z "$picked" ]]; then
-    echo -e "  ${RED}[x]${NC} 未能可靠确定 VPS 公网 IP。" >&2
-    echo -e "  请用: PUBLIC_HOST=你的VPS公网IP bash ..." >&2
+    echo -e "  ${RED}[x] 自动获取失败${NC}" >&2
     return 1
   fi
-
-  echo -e "${CYN}----------------${NC}" >&2
+  if is_private_ip "$picked"; then
+    echo -e "  ${RED}[x] 得到的是内网地址 ${picked}${NC}" >&2
+    return 1
+  fi
   echo "$picked"
 }
+
 
 image_present() {
   docker image inspect "$1" >/dev/null 2>&1
@@ -508,11 +550,11 @@ if [[ -z "${API_KEY:-}" ]]; then
 fi
 
 if ! FILL_HOST=$(detect_public_host); then
-  err "无法可靠确定 VPS 公网 IP。请显式指定：PUBLIC_HOST=你的VPS公网IP"
+  err "自动获取公网 IP 失败。请重跑并加上：PUBLIC_HOST=你的VPS公网IP"
 fi
-[[ -n "$FILL_HOST" ]] || err "无法可靠确定 VPS 公网 IP。请显式指定：PUBLIC_HOST=你的VPS公网IP"
+[[ -n "$FILL_HOST" ]] || err "自动获取公网 IP 失败。请重跑并加上：PUBLIC_HOST=你的VPS公网IP"
 if is_private_ip "$FILL_HOST"; then
-  err "当前选中的是内网地址 ${FILL_HOST}，跨机 AstrBot 无法访问。请用 PUBLIC_HOST=VPS公网IP 重跑。"
+  err "自动得到内网地址 ${FILL_HOST}。跨机不可用，请加：PUBLIC_HOST=VPS公网IP"
 fi
 # 仅在用户指定或探测成功后写入缓存
 printf '%s\n' "$FILL_HOST" > "$DEPLOY_DIR/.public_host"
